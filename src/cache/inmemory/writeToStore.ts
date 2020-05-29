@@ -21,15 +21,17 @@ import {
   StoreValue,
   StoreObject,
   Reference,
+  isReference,
 } from '../../utilities/graphql/storeUtils';
 
 import { shouldInclude, hasDirectives } from '../../utilities/graphql/directives';
 import { cloneDeep } from '../../utilities/common/cloneDeep';
 
-import { Policies, ReadMergeContext } from './policies';
-import { EntityStore } from './entityStore';
+import { ReadMergeContext } from './policies';
 import { NormalizedCache } from './types';
 import { makeProcessedFieldsMerger, FieldValueToBeMerged } from './helpers';
+import { StoreReader } from './readFromStore';
+import { InMemoryCache } from './inMemoryCache';
 
 export interface WriteContext extends ReadMergeContext {
   readonly store: NormalizedCache;
@@ -39,6 +41,8 @@ export interface WriteContext extends ReadMergeContext {
   readonly fragmentMap?: FragmentMap;
   // General-purpose deep-merge function for use during writes.
   merge<T>(existing: T, incoming: T): T;
+  // A JSON.stringify-serialized version of context.variables.
+  varString: string;
 };
 
 interface ProcessSelectionSetOptions {
@@ -46,22 +50,24 @@ interface ProcessSelectionSetOptions {
   result: Record<string, any>;
   selectionSet: SelectionSetNode;
   context: WriteContext;
-  typename?: string;
   out?: {
     shouldApplyMerges: boolean;
   };
 }
 
-export interface StoreWriterConfig {
-  policies: Policies;
-};
+export interface WriteToStoreOptions {
+  query: DocumentNode;
+  result: Object;
+  dataId?: string;
+  store: NormalizedCache;
+  variables?: Object;
+}
 
 export class StoreWriter {
-  private policies: Policies;
-
-  constructor(config: StoreWriterConfig) {
-    this.policies = config.policies;
-  }
+  constructor(
+    public readonly cache: InMemoryCache,
+    private reader?: StoreReader,
+  ) {}
 
   /**
    * Writes the result of a query to the store.
@@ -74,59 +80,52 @@ export class StoreWriter {
    *
    * @param variables A map from the name of a variable to its value. These variables can be
    * referenced by the query document.
+   *
+   * @return A `Reference` to the written object.
    */
-  public writeQueryToStore({
+  public writeToStore({
     query,
     result,
-    dataId = 'ROOT_QUERY',
-    store = new EntityStore.Root({
-      policies: this.policies,
-    }),
+    dataId,
+    store,
     variables,
-  }: {
-    query: DocumentNode;
-    result: Object;
-    dataId?: string;
-    store?: NormalizedCache;
-    variables?: Object;
-  }): NormalizedCache {
+  }: WriteToStoreOptions): Reference | undefined {
     const operationDefinition = getOperationDefinition(query)!;
-
-    // Any IDs written explicitly to the cache (including ROOT_QUERY, most
-    // frequently) will be retained as reachable root IDs on behalf of their
-    // owner DocumentNode objects, until/unless evicted for all owners.
-    store.retain(dataId);
-
     const merger = makeProcessedFieldsMerger();
 
-    this.processSelectionSet({
+    variables = {
+      ...getDefaultValues(operationDefinition),
+      ...variables,
+    };
+
+    const objOrRef = this.processSelectionSet({
       result: result || Object.create(null),
-      // Since we already know the dataId here, pass it to
-      // processSelectionSet to skip calling policies.identify
-      // unnecessarily.
       dataId,
       selectionSet: operationDefinition.selectionSet,
-      // If dataId is a well-known root ID such as ROOT_QUERY, we can
-      // infer its __typename immediately here. Otherwise, the __typename
-      // will be determined in processSelectionSet, as usual.
-      typename: this.policies.rootTypenamesById[dataId],
       context: {
         store,
         written: Object.create(null),
         merge<T>(existing: T, incoming: T) {
           return merger.merge(existing, incoming) as T;
         },
-        variables: {
-          ...getDefaultValues(operationDefinition),
-          ...variables,
-        },
+        variables,
+        varString: JSON.stringify(variables),
         fragmentMap: createFragmentMap(getFragmentDefinitions(query)),
         toReference: store.toReference,
         getFieldValue: store.getFieldValue,
       },
     });
 
-    return store;
+    const ref = isReference(objOrRef) ? objOrRef :
+      dataId && makeReference(dataId) || void 0;
+
+    if (ref) {
+      // Any IDs written explicitly to the cache (including ROOT_QUERY,
+      // most frequently) will be retained as reachable root IDs.
+      store.retain(ref.__ref);
+    }
+
+    return ref;
   }
 
   private processSelectionSet({
@@ -134,33 +133,22 @@ export class StoreWriter {
     result,
     selectionSet,
     context,
-    typename,
     // This object allows processSelectionSet to report useful information
     // to its callers without explicitly returning that information.
     out = {
       shouldApplyMerges: false,
     },
   }: ProcessSelectionSetOptions): StoreObject | Reference {
-    const { policies } = this;
-
-    // This mergedFields variable will be repeatedly updated using context.merge
-    // to accumulate all fields that need to be written into the store.
-    let mergedFields: StoreObject = Object.create(null);
+    const { policies } = this.cache;
 
     // Identify the result object, even if dataId was already provided,
     // since we always need keyObject below.
-    const [id, keyObject] =
-      policies.identify(result, selectionSet, context.fragmentMap);
+    const [id, keyObject] = policies.identify(
+      result, selectionSet, context.fragmentMap);
 
     // If dataId was not provided, fall back to the id just generated by
     // policies.identify.
     dataId = dataId || id;
-
-    // Write any key fields that were used during identification, even if
-    // they were not mentioned in the original query.
-    if (keyObject) {
-      mergedFields = context.merge(mergedFields, keyObject);
-    }
 
     if ("string" === typeof dataId) {
       // Avoid processing the same entity object using the same selection
@@ -169,14 +157,41 @@ export class StoreWriter {
       // size of this array is likely to be very small, meaning indexOf is
       // likely to be faster than Set.prototype.has.
       const sets = context.written[dataId] || (context.written[dataId] = []);
-      if (sets.indexOf(selectionSet) >= 0) return makeReference(dataId);
+      const ref = makeReference(dataId);
+      if (sets.indexOf(selectionSet) >= 0) return ref;
       sets.push(selectionSet);
+
+      // If we're about to write a result object into the store, but we
+      // happen to know that the exact same (===) result object would be
+      // returned if we were to reread the result with the same inputs,
+      // then we can skip the rest of the processSelectionSet work for
+      // this object, and immediately return a Reference to it.
+      if (this.reader && this.reader.isFresh(
+        result,
+        context.store,
+        ref,
+        selectionSet,
+        context.varString,
+      )) {
+        return ref;
+      }
+    }
+
+    // This mergedFields variable will be repeatedly updated using context.merge
+    // to accumulate all fields that need to be written into the store.
+    let mergedFields: StoreObject = Object.create(null);
+
+    // Write any key fields that were used during identification, even if
+    // they were not mentioned in the original query.
+    if (keyObject) {
+      mergedFields = context.merge(mergedFields, keyObject);
     }
 
     // If typename was not passed in, infer it. Note that typename is
     // always passed in for tricky-to-infer cases such as "Query" for
     // ROOT_QUERY.
-    typename = typename ||
+    const typename =
+      (dataId && policies.rootTypenamesById[dataId]) ||
       getTypenameFromResult(result, selectionSet, context.fragmentMap) ||
       (dataId && context.store.get(dataId, "__typename") as string);
 
@@ -194,11 +209,12 @@ export class StoreWriter {
         const value = result[resultFieldKey];
 
         if (typeof value !== 'undefined') {
-          const storeFieldName = policies.getStoreFieldName(
+          const storeFieldName = policies.getStoreFieldName({
             typename,
-            selection,
-            context.variables,
-          );
+            fieldName: selection.name.value,
+            field: selection,
+            variables: context.variables,
+          });
 
           let incomingValue =
             this.processFieldValue(value, selection, context, out);
@@ -277,8 +293,7 @@ export class StoreWriter {
     }
 
     if (Array.isArray(value)) {
-      return value.map(
-        (item, i) => this.processFieldValue(item, field, context, out));
+      return value.map(item => this.processFieldValue(item, field, context, out));
     }
 
     return this.processSelectionSet({
